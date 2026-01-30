@@ -1,10 +1,11 @@
 <#
 .SYNOPSIS
-  AD Inactive Device Review v2.1 (READ-ONLY) - configuration via variables in script
+  AD Inactive Device Review v2.1.1 (READ-ONLY) - configuration via variables in script
 
 .DESCRIPTION
   Inventory and assess inactive AD computer objects, with selectable mode:
-    - Servers  = non-clients (Windows Server + Linux/Unix/non-client devices), excludes clients
+    - Servers  = STRICT allow-list (WindowsServer, Linux, Unix, NonWindowsNonClient)
+                NOTE: Clients and Unknown are excluded by default in Servers mode.
     - Clients  = clients only
     - All      = everything
 
@@ -31,20 +32,27 @@
 # =========================
 # CONFIG (edit these only)
 # =========================
-$Mode                 = "Servers"   # Servers | Clients | All
-$InactiveDays          = 180
-$DisableCandidateDays  = 180
-$DeleteCandidateDays   = 365
+$ScriptVersion         = "2.1.1"
 
-$AllDCs               = $false      # $true = query lastLogon across all DCs (heavier)
-$SearchBase           = ""          # e.g. "OU=Servers,DC=tdk,DC=dk" or "" for whole domain
-$ResolveDns           = $false
-$Ping                 = $false
-$ExcludeUnknownOS     = $true
+$Mode                  = "Clients"   # Servers | Clients | All
+$InactiveDays           = 180
+$DisableCandidateDays   = 180
+$DeleteCandidateDays    = 365
+
+$AllDCs                = $false      # $true = query lastLogon across all DCs (heavier)
+$SearchBase            = ""          # e.g. "OU=Servers,DC=tdk,DC=dk" or "" for whole domain
+$ResolveDns            = $false
+$Ping                  = $false
+
+# If true: exclude objects where OperatingSystem is empty/unknown
+$ExcludeUnknownOS      = $false
+
+# If true: allow Unknown OS objects in Servers mode (default false = strict)
+$IncludeUnknownInServers = $false
 
 # Base output folder + per-run timestamp subfolder
-$RunTimestamp         = Get-Date -Format "yyyyMMdd_HHmmss"
-$OutDir               = "C:\Temp\AD_InactiveDevices\$RunTimestamp"
+$RunTimestamp          = Get-Date -Format "yyyyMMdd_HHmmss"
+$OutDir                = "C:\Temp\AD_InactiveDevices\$RunTimestamp"
 # =========================
 
 Set-StrictMode -Version Latest
@@ -101,10 +109,6 @@ function Get-DeviceClassV2 {
       Unix
       NonWindowsNonClient
       Unknown
-
-    Notes:
-      - Uses OperatingSystem string, which can be empty or inconsistent.
-      - "Unknown" = empty or non-matching string.
   #>
   param([string]$OperatingSystem)
 
@@ -139,21 +143,37 @@ function Get-DeviceClassV2 {
   )
   foreach ($p in $unixPatterns) { if ($os -match $p) { return "Unix" } }
 
-  # Other non-windows, non-client
+  # Other non-windows, non-client (appliances often show odd strings)
   if ($os -notmatch '^Windows') { return "NonWindowsNonClient" }
 
   return "Unknown"
+}
+
+function Get-ModeAllowedClasses {
+  param(
+    [Parameter(Mandatory)][string]$Mode,
+    [Parameter(Mandatory)][bool]$IncludeUnknownInServers
+  )
+  switch ($Mode) {
+    "Servers" {
+      $allowed = @("WindowsServer","Linux","Unix","NonWindowsNonClient")
+      if ($IncludeUnknownInServers) { $allowed += "Unknown" }
+      return $allowed
+    }
+    "Clients" { return @("Client") }
+    "All"     { return @("Client","WindowsServer","Linux","Unix","NonWindowsNonClient","Unknown") }
+    default   { throw "Invalid Mode '$Mode'." }
+  }
 }
 
 # -------------------------
 # Validation of config
 # -------------------------
 $validModes = @("Servers","Clients","All")
-if ($validModes -notcontains $Mode) {
-  throw "Invalid `$Mode '$Mode'. Allowed: Servers, Clients, All."
-}
-if ($InactiveDays -lt 0 -or $DisableCandidateDays -lt 0 -or $DeleteCandidateDays -lt 0) {
-  throw "Days values must be >= 0."
+if ($validModes -notcontains $Mode) { throw "Invalid `$Mode '$Mode'. Allowed: Servers, Clients, All." }
+
+foreach ($d in @($InactiveDays,$DisableCandidateDays,$DeleteCandidateDays)) {
+  if ($d -lt 0) { throw "Days values must be >= 0." }
 }
 if ($DisableCandidateDays -gt $DeleteCandidateDays) {
   Write-Warning "DisableCandidateDays ($DisableCandidateDays) is greater than DeleteCandidateDays ($DeleteCandidateDays). This may be unintended."
@@ -164,19 +184,20 @@ Import-Module ActiveDirectory
 Ensure-Directory -Path $OutDir
 
 # Keep stamp for filenames as well (same value as folder timestamp)
-$stamp = $RunTimestamp
-
-$csvPath  = Join-Path $OutDir "InactiveDevices_$stamp.csv"
-$txtPath  = Join-Path $OutDir "InactiveDevices_$stamp`_FindingsSummary.txt"
-$logPath  = Join-Path $OutDir "InactiveDevices_$stamp`_RunTranscript.txt"
+$stamp   = $RunTimestamp
+$csvPath = Join-Path $OutDir "InactiveDevices_$stamp.csv"
+$txtPath = Join-Path $OutDir "InactiveDevices_$stamp`_FindingsSummary.txt"
+$logPath = Join-Path $OutDir "InactiveDevices_$stamp`_RunTranscript.txt"
 
 Start-Transcript -Path $logPath | Out-Null
 
 try {
   $domain = Get-ADDomain
   $dcs = (Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
-
   $cutInactive = (Get-Date).AddDays(-$InactiveDays)
+
+  $allowedClasses = Get-ModeAllowedClasses -Mode $Mode -IncludeUnknownInServers:$IncludeUnknownInServers
+  $allowedClassSet = [System.Collections.Generic.HashSet[string]]::new([string[]]$allowedClasses)
 
   $searchParams = @{
     Filter     = '*'
@@ -187,16 +208,17 @@ try {
       'servicePrincipalName','memberOf','DNSHostName','DistinguishedName'
     )
   }
-  if ($SearchBase -and $SearchBase.Trim()) {
-    $searchParams['SearchBase'] = $SearchBase.Trim()
-  }
+  if ($SearchBase -and $SearchBase.Trim()) { $searchParams['SearchBase'] = $SearchBase.Trim() }
 
+  Write-Host "ScriptVersion: $ScriptVersion"
   Write-Host "Domain: $($domain.DNSRoot)"
   Write-Host "DCs: $($dcs -join ', ')"
   Write-Host "Mode: $Mode"
+  Write-Host "Allowed DeviceClasses: $($allowedClasses -join ', ')"
   Write-Host "Inactive cutoff: $cutInactive (InactiveDays=$InactiveDays)"
   Write-Host "LastLogon mode: $(if ($AllDCs) {"All DCs (lastLogon)"} else {"Replicated (LastLogonDate)"} )"
   Write-Host "ExcludeUnknownOS: $ExcludeUnknownOS"
+  Write-Host "IncludeUnknownInServers: $IncludeUnknownInServers"
   Write-Host "SearchBase: $(if ($SearchBase) {$SearchBase} else {"<DomainRoot>"} )"
   Write-Host "ResolveDns: $ResolveDns | Ping: $Ping"
   Write-Host "OutDir: $OutDir"
@@ -214,12 +236,8 @@ try {
 
     if ($ExcludeUnknownOS -and $deviceClass -eq "Unknown") { continue }
 
-    # Mode filtering
-    switch ($Mode) {
-      "Servers" { if ($deviceClass -eq "Client") { continue } }
-      "Clients" { if ($deviceClass -ne "Client") { continue } }
-      "All"     { }
-    }
+    # STRICT mode filtering: only include allowed classes for the selected mode
+    if (-not $allowedClassSet.Contains($deviceClass)) { continue }
 
     # Determine last logon
     $lastLogon = $null
@@ -229,9 +247,11 @@ try {
       $lastLogon = $c.LastLogonDate
     }
 
+    # If never logged on, use whenCreated as effective last seen
     $effectiveLastSeen = $lastLogon
     if (-not $effectiveLastSeen) { $effectiveLastSeen = $c.whenCreated }
 
+    # Inactivity filter
     if ($effectiveLastSeen -ge $cutInactive) { continue }
 
     $ouPath = Get-OUPathFromDN -DistinguishedName $c.DistinguishedName
@@ -283,7 +303,12 @@ try {
     if ($Ping) { $pingOK = Safe-Ping -Name $c.Name }
 
     $results.Add([pscustomobject]@{
-      Mode                   = $Mode
+      ScriptVersion          = $ScriptVersion
+      RunTimestamp           = $RunTimestamp
+
+      ConfigMode             = $Mode
+      AllowedClasses         = ($allowedClasses -join ',')
+
       Name                   = $c.Name
       DNSHostName            = $c.DNSHostName
       Enabled                = $c.Enabled
@@ -333,14 +358,17 @@ try {
   $topSPN = $results | Where-Object { $_.SPNCount -gt 0 } | Sort-Object SPNCount -Descending | Select-Object -First 20
 
   $lines = New-Object System.Collections.Generic.List[string]
-  $lines.Add("AD Inactive Device Review v2.1 - Summary")
+  $lines.Add("AD Inactive Device Review v$ScriptVersion - Summary")
   $lines.Add("Timestamp: $(Get-Date)")
+  $lines.Add("RunTimestamp: $RunTimestamp")
   $lines.Add("Domain: $($domain.DNSRoot)")
   $lines.Add("SearchBase: $(if ($SearchBase) {$SearchBase} else {"<DomainRoot>"} )")
   $lines.Add("Mode: $Mode")
+  $lines.Add("Allowed DeviceClasses: $($allowedClasses -join ', ')")
   $lines.Add("InactiveDays: $InactiveDays | DisableCandidateDays: $DisableCandidateDays | DeleteCandidateDays: $DeleteCandidateDays")
   $lines.Add("LastLogon mode: $(if ($AllDCs) {"All DCs (lastLogon)"} else {"Replicated (LastLogonDate)"} )")
   $lines.Add("ExcludeUnknownOS: $ExcludeUnknownOS")
+  $lines.Add("IncludeUnknownInServers: $IncludeUnknownInServers")
   $lines.Add("ResolveDns: $ResolveDns | Ping: $Ping")
   $lines.Add("OutDir: $OutDir")
   $lines.Add("")
@@ -371,9 +399,10 @@ try {
   $lines.Add("  Transcript: $logPath")
   $lines.Add("")
   $lines.Add("Notes")
+  $lines.Add("  - STRICT mode filtering is enforced via allow-list by DeviceClass.")
+  $lines.Add("  - In Servers mode, Client is NEVER included. Unknown is included only if IncludeUnknownInServers=$true.")
   $lines.Add("  - SuggestedLifecycleStep is guidance only; validate ownership/CMDB/service dependency before any action.")
   $lines.Add("  - Suggested decom lifecycle: CMDB status -> Monitoring removal -> AD disable -> SPN review -> Group cleanup -> AD delete (after retention).")
-  $lines.Add("  - If you see too many Unknown OS entries, keep ExcludeUnknownOS=$true or improve OS string hygiene in AD.")
 
   $lines | Out-File -FilePath $txtPath -Encoding UTF8
 
