@@ -193,15 +193,20 @@ Start-Transcript -Path $logPath | Out-Null
 
 try {
   $domain = Get-ADDomain
-  $dcs = (Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
+  $dcs = @()
+  if ($AllDCs) {
+    $dcs = (Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
+  }
   $cutInactive = (Get-Date).AddDays(-$InactiveDays)
 
   $allowedClasses = Get-ModeAllowedClasses -Mode $Mode -IncludeUnknownInServers:$IncludeUnknownInServers
   $allowedClassSet = [System.Collections.Generic.HashSet[string]]::new([string[]]$allowedClasses)
 
   $searchParams = @{
-    Filter     = '*'
-    Properties = @(
+    Filter         = '*'
+    ResultPageSize = 2000
+    ResultSetSize  = $null
+    Properties     = @(
       'OperatingSystem','OperatingSystemVersion',
       'Enabled','LastLogonDate','lastLogonTimestamp',
       'pwdLastSet','whenCreated','whenChanged',
@@ -212,7 +217,7 @@ try {
 
   Write-Host "ScriptVersion: $ScriptVersion"
   Write-Host "Domain: $($domain.DNSRoot)"
-  Write-Host "DCs: $($dcs -join ', ')"
+  Write-Host "DCs: $(if ($AllDCs) { $dcs -join ', ' } else { '<skipped>' })"
   Write-Host "Mode: $Mode"
   Write-Host "Allowed DeviceClasses: $($allowedClasses -join ', ')"
   Write-Host "Inactive cutoff: $cutInactive (InactiveDays=$InactiveDays)"
@@ -224,13 +229,20 @@ try {
   Write-Host "OutDir: $OutDir"
   Write-Host ""
 
-  $computers = Get-ADComputer @searchParams
-  $results = New-Object System.Collections.Generic.List[object]
+  $resultsCount = 0
+  $enabledCount = 0
+  $deleteCand = 0
+  $disableCand = 0
+  $reviewOnly = 0
+  $byClassCounts = @{}
+  $byOUCounts = @{}
+  $topSPN = New-Object System.Collections.Generic.List[object]
+  $csvInitialized = $false
 
   $i = 0
-  foreach ($c in $computers) {
+  foreach ($c in (Get-ADComputer @searchParams)) {
     $i++
-    if ($i % 500 -eq 0) { Write-Host "Processed $i / $($computers.Count)..." }
+    if ($i % 500 -eq 0) { Write-Host "Processed $i..." }
 
     $deviceClass = Get-DeviceClassV2 -OperatingSystem $c.OperatingSystem
 
@@ -302,7 +314,7 @@ try {
     if ($ResolveDns) { $dnsOK = Safe-ResolveDns -Name $c.Name }
     if ($Ping) { $pingOK = Safe-Ping -Name $c.Name }
 
-    $results.Add([pscustomobject]@{
+    $row = [pscustomobject]@{
       ScriptVersion          = $ScriptVersion
       RunTimestamp           = $RunTimestamp
 
@@ -337,25 +349,43 @@ try {
 
       SuggestedLifecycleStep = $step
       Rationale              = ($rationale -join ';')
-    })
+    }
+
+    if (-not $csvInitialized) {
+      $row | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+      $csvInitialized = $true
+    } else {
+      $row | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -Append
+    }
+
+    $resultsCount++
+    if ($row.Enabled) { $enabledCount++ }
+    switch ($row.SuggestedLifecycleStep) {
+      "DeleteCandidate" { $deleteCand++ }
+      "DisableCandidate" { $disableCand++ }
+      default { $reviewOnly++ }
+    }
+
+    if (-not $byClassCounts.ContainsKey($row.DeviceClass)) { $byClassCounts[$row.DeviceClass] = 0 }
+    $byClassCounts[$row.DeviceClass]++
+
+    if (-not $byOUCounts.ContainsKey($row.OUPath)) { $byOUCounts[$row.OUPath] = 0 }
+    $byOUCounts[$row.OUPath]++
+
+    if ($row.SPNCount -gt 0) { $topSPN.Add($row) }
   }
 
-  $results |
-    Sort-Object DaysInactive -Descending |
-    Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+  if (-not $csvInitialized) {
+    "" | Out-File -FilePath $csvPath -Encoding UTF8
+  }
 
   # Summary
-  $total = $results.Count
-  $enabledCount  = ($results | Where-Object Enabled).Count
+  $total = $resultsCount
   $disabledCount = $total - $enabledCount
 
-  $deleteCand  = ($results | Where-Object SuggestedLifecycleStep -eq "DeleteCandidate").Count
-  $disableCand = ($results | Where-Object SuggestedLifecycleStep -eq "DisableCandidate").Count
-  $reviewOnly  = ($results | Where-Object SuggestedLifecycleStep -eq "Review").Count
-
-  $byClass = $results | Group-Object DeviceClass | Sort-Object Count -Descending
-  $topOU = $results | Group-Object OUPath | Sort-Object Count -Descending | Select-Object -First 10
-  $topSPN = $results | Where-Object { $_.SPNCount -gt 0 } | Sort-Object SPNCount -Descending | Select-Object -First 20
+  $byClass = $byClassCounts.GetEnumerator() | Sort-Object Value -Descending
+  $topOU = $byOUCounts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 10
+  $topSPN = $topSPN | Sort-Object SPNCount -Descending | Select-Object -First 20
 
   $lines = New-Object System.Collections.Generic.List[string]
   $lines.Add("AD Inactive Device Review v$ScriptVersion - Summary")
@@ -378,7 +408,7 @@ try {
   $lines.Add("  Disabled: $disabledCount")
   $lines.Add("")
   $lines.Add("By DeviceClass")
-  foreach ($g in $byClass) { $lines.Add(("  {0} -> {1}" -f $g.Name, $g.Count)) }
+  foreach ($g in $byClass) { $lines.Add(("  {0} -> {1}" -f $g.Key, $g.Value)) }
   $lines.Add("")
   $lines.Add("Lifecycle recommendation (read-only)")
   $lines.Add("  DeleteCandidate: $deleteCand")
@@ -386,7 +416,7 @@ try {
   $lines.Add("  Review: $reviewOnly")
   $lines.Add("")
   $lines.Add("Top OUs by inactive object count (Top 10)")
-  foreach ($g in $topOU) { $lines.Add(("  {0}  ->  {1}" -f $g.Count, $g.Name)) }
+  foreach ($g in $topOU) { $lines.Add(("  {0}  ->  {1}" -f $g.Value, $g.Key)) }
   $lines.Add("")
   $lines.Add("Top inactive objects with SPNs (Top 20) - decom/service dependency review required")
   foreach ($x in $topSPN) {
