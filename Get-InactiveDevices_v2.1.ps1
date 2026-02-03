@@ -437,8 +437,9 @@ try {
   $lines.Add("")
   $lines.Add("By DeviceClass")
   foreach ($g in $byClass) {
-    $count = if ($null -ne $g.Count) { $g.Count } else { $g.Value }
-    $lines.Add(("  {0} -> {1}" -f $g.Name, $count))
+    $count = if ($g.PSObject.Properties['Count']) { $g.Count } elseif ($g.PSObject.Properties['Value']) { $g.Value } else { 0 }
+    $name = if ($g.PSObject.Properties['Name']) { $g.Name } else { $g.Key }
+    $lines.Add(("  {0} -> {1}" -f $name, $count))
   }
   $lines.Add("")
   $lines.Add("Lifecycle recommendation (read-only)")
@@ -448,8 +449,9 @@ try {
   $lines.Add("")
   $lines.Add("Top OUs by inactive object count (Top 10)")
   foreach ($g in $topOU) {
-    $count = if ($null -ne $g.Count) { $g.Count } else { $g.Value }
-    $lines.Add(("  {0}  ->  {1}" -f $count, $g.Name))
+    $count = if ($g.PSObject.Properties['Count']) { $g.Count } elseif ($g.PSObject.Properties['Value']) { $g.Value } else { 0 }
+    $name = if ($g.PSObject.Properties['Name']) { $g.Name } else { $g.Key }
+    $lines.Add(("  {0}  ->  {1}" -f $count, $name))
   }
   $lines.Add("")
   $lines.Add("Top inactive objects with SPNs (Top 20) - decom/service dependency review required")
