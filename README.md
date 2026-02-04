@@ -1,5 +1,5 @@
 ````markdown
-# AD Inactive Device Review (v2.1)
+# AD Inactive Device Review (v2.1.1)
 
 **READ-ONLY PowerShell script** for identifying and assessing **inactive computer objects in Active Directory**, with explicit support for:
 
@@ -24,6 +24,10 @@ The script is designed to support **security hygiene, AD governance, and server/
   - Unknown
 - ✔ Read-only – **no changes made to AD**
 - ✔ Optional **accurate lastLogon** across all DCs
+- ✔ **Streaming CSV output** for large environments
+- ✔ **Configurable AD paging size** for performance tuning
+- ✔ Optional **DNS resolution / ping checks**
+- ✔ **Strict allow-list filtering** per mode (with optional Unknown in Servers)
 - ✔ Flags **decommission candidates**
 - ✔ Produces **audit-friendly output**
 - ✔ One output folder **per execution (timestamped)**
@@ -55,7 +59,7 @@ The script is designed to support **security hygiene, AD governance, and server/
 All configuration is done **inside the script** in the `CONFIG` section:
 
 ```powershell
-$Mode                 = "Servers"   # Servers | Clients | All
+$Mode                  = "Servers"   # Servers | Clients | All
 $InactiveDays          = 180
 $DisableCandidateDays  = 180
 $DeleteCandidateDays   = 365
@@ -64,7 +68,11 @@ $AllDCs               = $false
 $SearchBase           = ""
 $ResolveDns           = $false
 $Ping                 = $false
-$ExcludeUnknownOS     = $true
+$ResultPageSize        = 500
+$StreamCsv             = $true
+$SortCsvByDaysInactive = $false
+$ExcludeUnknownOS      = $true
+$IncludeUnknownInServers = $false
 
 $RunTimestamp         = Get-Date -Format "yyyyMMdd_HHmmss"
 $OutDir               = "C:\Temp\AD_InactiveDevices\$RunTimestamp"
@@ -107,7 +115,9 @@ Detailed inventory including:
 * Last logon (effective)
 * Days inactive
 * SPN count
-* Group membership count
+* Group membership count + sample
+* Password last set / created / changed timestamps
+* DNS resolution / ping results (if enabled)
 * Lifecycle recommendation
 * Rationale
 
@@ -152,6 +162,7 @@ Additional risk flags:
 * Linux/Unix devices rely on **OperatingSystem string hygiene**
 * Objects with SPNs should **never be deleted blindly**
 * Script intentionally avoids automation to prevent accidents
+* `StreamCsv=$true` disables sorting by DaysInactive (by design)
 
 ---
 
